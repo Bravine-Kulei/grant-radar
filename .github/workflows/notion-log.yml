@@ -1,0 +1,80 @@
+name: Log push to Notion Projects
+
+on:
+  push:
+    branches: [main, master]
+
+jobs:
+  log-to-notion:
+    runs-on: ubuntu-latest
+    env:
+      PROJECT_KEYWORD: "grant"
+      NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+      NOTION_PROJECTS_DB: ${{ secrets.NOTION_PROJECTS_DB }}
+    steps:
+      - name: Log push event to Notion
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "${NOTION_TOKEN}" ] || [ -z "${NOTION_PROJECTS_DB}" ]; then
+            echo "Missing NOTION_TOKEN or NOTION_PROJECTS_DB secret. Skipping."
+            exit 0
+          fi
+
+          COMMIT_MSG=$(echo "${{ github.event.head_commit.message }}" | head -n1 | tr -d '"' | tr -d '\n' | head -c 200)
+          SHA_SHORT=$(echo "${{ github.event.head_commit.id }}" | cut -c1-7)
+          REPO="${{ github.repository }}"
+          TODAY=$(date -u +%Y-%m-%d)
+          LOG_LINE="${TODAY} — pushed: ${COMMIT_MSG} (${SHA_SHORT}, ${REPO})"
+
+          echo "Searching Notion DB for project matching '${PROJECT_KEYWORD}'..."
+
+          QUERY_RESPONSE=$(curl -sS -X POST \
+            "https://api.notion.com/v1/databases/${NOTION_PROJECTS_DB}/query" \
+            -H "Authorization: Bearer ${NOTION_TOKEN}" \
+            -H "Notion-Version: 2022-06-28" \
+            -H "Content-Type: application/json" \
+            -d '{"page_size": 100}')
+
+          PAGE_ID=$(echo "$QUERY_RESPONSE" | python3 -c "
+          import json, os, sys
+          kw = os.environ['PROJECT_KEYWORD'].lower()
+          data = json.load(sys.stdin)
+          for page in data.get('results', []):
+              title_parts = page['properties'].get('Name', {}).get('title', [])
+              title = ''.join(t.get('plain_text', '') for t in title_parts)
+              if kw in title.lower():
+                  print(page['id'])
+                  break
+          ")
+
+          if [ -z "$PAGE_ID" ]; then
+            echo "::warning::No Notion project page matched keyword '${PROJECT_KEYWORD}'."
+            exit 0
+          fi
+
+          echo "Matched page: ${PAGE_ID}"
+          echo "Appending: ${LOG_LINE}"
+
+          PAYLOAD=$(LOG_LINE="$LOG_LINE" python3 -c "
+          import json, os
+          print(json.dumps({
+              'children': [{
+                  'object': 'block',
+                  'type': 'bulleted_list_item',
+                  'bulleted_list_item': {
+                      'rich_text': [{'type': 'text', 'text': {'content': os.environ['LOG_LINE']}}]
+                  }
+              }]
+          }))
+          ")
+
+          curl -sS -X PATCH \
+            "https://api.notion.com/v1/blocks/${PAGE_ID}/children" \
+            -H "Authorization: Bearer ${NOTION_TOKEN}" \
+            -H "Notion-Version: 2022-06-28" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" > /dev/null
+
+          echo "✓ Logged to Notion."
